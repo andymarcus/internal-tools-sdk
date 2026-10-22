@@ -43,7 +43,16 @@ function isGatewayPayload(value) {
         return false;
     }
     const candidate = value;
-    return (candidate.version === GATEWAY_AUTH_VERSION &&
+    return ((candidate.authMethod === undefined ||
+        candidate.authMethod === "session" ||
+        candidate.authMethod === "oauth") &&
+        (candidate.clientId === undefined ||
+            candidate.clientId === null ||
+            typeof candidate.clientId === "string") &&
+        (candidate.scopes === undefined ||
+            (Array.isArray(candidate.scopes) &&
+                candidate.scopes.every((scope) => typeof scope === "string"))) &&
+        candidate.version === GATEWAY_AUTH_VERSION &&
         typeof candidate.email === "string" &&
         typeof candidate.host === "string" &&
         typeof candidate.iat === "number" &&
@@ -60,6 +69,13 @@ export async function createGatewayHeaders(input) {
         path: input.path,
         tool: input.tool,
         version: GATEWAY_AUTH_VERSION,
+        ...(input.auth
+            ? {
+                authMethod: input.auth.method,
+                clientId: input.auth.clientId ?? null,
+                scopes: [...(input.auth.scopes ?? [])],
+            }
+            : {}),
     };
     const encodedPayload = toBase64Url(encoder.encode(JSON.stringify(payload)));
     const signature = await signValue(encodedPayload, input.secret);

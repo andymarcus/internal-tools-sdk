@@ -6,10 +6,19 @@ export type GatewayIdentity = {
     image?: string | null;
     name?: string | null;
 };
+export type GatewayAuthMethod = "session" | "oauth";
+export type GatewayAuthInfo = {
+    clientId?: string | null;
+    method: GatewayAuthMethod;
+    scopes?: string[];
+};
 export type GatewayPayload = GatewayIdentity & {
+    authMethod?: GatewayAuthMethod;
+    clientId?: string | null;
     host: string;
     iat: number;
     path: string;
+    scopes?: string[];
     tool: string;
     version: typeof GATEWAY_AUTH_VERSION;
 };
@@ -18,6 +27,7 @@ export declare class GatewayAuthError extends Error {
 }
 type HeadersLike = Headers | Pick<Headers, "get">;
 export declare function createGatewayHeaders(input: {
+    auth?: GatewayAuthInfo;
     host: string;
     path: string;
     secret: string;

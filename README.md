@@ -7,7 +7,7 @@ The gateway authenticates users once with Google SSO, then forwards signed ident
 ## Install from GitHub
 
 ```bash
-npm install github:andymarcus/internal-tools-sdk#v0.1.0
+npm install github:andymarcus/internal-tools-sdk#v0.2.0
 ```
 
 ## Required environment variable
@@ -44,6 +44,23 @@ export default async function Page() {
   const user = await requireInternalToolUser();
 
   return <main>Signed in as {user.email}</main>;
+}
+```
+
+## MCP and OAuth calls
+
+Since 0.2.0 the gateway payload also says how the gateway authenticated the request:
+
+- `authMethod: "session"`: a person using the tool in their browser through Google SSO.
+- `authMethod: "oauth"`: an MCP client (such as Claude) calling the tool's MCP endpoint with a gateway-issued access token on the user's behalf. `clientId` identifies the client and `scopes` lists the OAuth scopes the user granted.
+
+Payloads from gateways older than 0.2.0 have no `authMethod`. Treat that as a browser session. The gateway never forwards the client's access token, so the tool only ever sees the signed headers.
+
+```ts
+const user = await requireInternalToolUser();
+
+if (user.authMethod === "oauth" && !user.scopes?.includes("write")) {
+  throw new Error("This MCP client only has read access.");
 }
 ```
 

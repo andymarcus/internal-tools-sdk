@@ -10,10 +10,24 @@ export type GatewayIdentity = {
   name?: string | null;
 };
 
+export type GatewayAuthMethod = "session" | "oauth";
+
+// How the gateway authenticated the request. "oauth" means an MCP client called the tool with
+// a gateway-issued access token on behalf of the user.
+export type GatewayAuthInfo = {
+  clientId?: string | null;
+  method: GatewayAuthMethod;
+  scopes?: string[];
+};
+
 export type GatewayPayload = GatewayIdentity & {
+  // Optional so payloads from older gateways still verify.
+  authMethod?: GatewayAuthMethod;
+  clientId?: string | null;
   host: string;
   iat: number;
   path: string;
+  scopes?: string[];
   tool: string;
   version: typeof GATEWAY_AUTH_VERSION;
 };
@@ -80,6 +94,15 @@ function isGatewayPayload(value: unknown): value is GatewayPayload {
   const candidate = value as Record<string, unknown>;
 
   return (
+    (candidate.authMethod === undefined ||
+      candidate.authMethod === "session" ||
+      candidate.authMethod === "oauth") &&
+    (candidate.clientId === undefined ||
+      candidate.clientId === null ||
+      typeof candidate.clientId === "string") &&
+    (candidate.scopes === undefined ||
+      (Array.isArray(candidate.scopes) &&
+        candidate.scopes.every((scope) => typeof scope === "string"))) &&
     candidate.version === GATEWAY_AUTH_VERSION &&
     typeof candidate.email === "string" &&
     typeof candidate.host === "string" &&
@@ -90,6 +113,7 @@ function isGatewayPayload(value: unknown): value is GatewayPayload {
 }
 
 export async function createGatewayHeaders(input: {
+  auth?: GatewayAuthInfo;
   host: string;
   path: string;
   secret: string;
@@ -105,6 +129,13 @@ export async function createGatewayHeaders(input: {
     path: input.path,
     tool: input.tool,
     version: GATEWAY_AUTH_VERSION,
+    ...(input.auth
+      ? {
+          authMethod: input.auth.method,
+          clientId: input.auth.clientId ?? null,
+          scopes: [...(input.auth.scopes ?? [])],
+        }
+      : {}),
   };
 
   const encodedPayload = toBase64Url(encoder.encode(JSON.stringify(payload)));

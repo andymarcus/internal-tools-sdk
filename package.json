@@ -1,6 +1,6 @@
 {
   "name": "@meandu/internal-tools-sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Helpers for me&u internal tools that verify signed gateway identity headers.",
   "type": "module",
   "license": "UNLICENSED",
