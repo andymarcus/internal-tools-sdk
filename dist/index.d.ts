@@ -4,6 +4,7 @@ export declare const GATEWAY_AUTH_VERSION = "v1";
 export declare const GATEWAY_TOKEN_HEADER = "x-meandu-gateway-token";
 export declare const GATEWAY_TOKEN_VERSION = "v2";
 export declare const GATEWAY_TOKEN_TYPE = "gateway+jwt";
+export declare const SERVICE_API_PATH_PREFIX = "/api/service";
 export type GatewayIdentity = {
     email: string;
     image?: string | null;
@@ -35,7 +36,6 @@ export type GatewayServicePayload = {
     host: string;
     iat: number;
     path: string;
-    scopes: string[];
     tool: string;
     version: typeof GATEWAY_TOKEN_VERSION;
 };
@@ -137,8 +137,7 @@ export declare function requireGatewayHeaders(headers: HeadersLike, input: Gatew
 }): Promise<GatewayUserPayload>;
 export declare function requireGatewayHeaders(headers: HeadersLike, input: GatewayVerifyOptions): Promise<GatewayPayload>;
 export declare function requireServiceCaller(headers: HeadersLike, input: GatewayTokenVerifyOptions & {
-    allowedCallers?: string[];
-    requiredScopes?: string[];
+    allowedCallers: string[];
 }): Promise<GatewayServicePayload>;
 export type ToolClient = {
     fetch(path: string, init?: RequestInit): Promise<Response>;
@@ -149,8 +148,6 @@ export type ToolClientOptions = {
     gatewayOrigin: string;
     getOidcToken: () => Promise<string>;
     now?: () => number;
-    scope?: string | string[];
-    servicePath?: string;
     targetTool: string;
 };
 export declare function createToolClient(options: ToolClientOptions): ToolClient;

@@ -8,6 +8,8 @@ export const GATEWAY_AUTH_VERSION = "v1";
 export const GATEWAY_TOKEN_HEADER = "x-meandu-gateway-token";
 export const GATEWAY_TOKEN_VERSION = "v2";
 export const GATEWAY_TOKEN_TYPE = "gateway+jwt";
+// Every tool's service API lives under this path, e.g. /crm/api/service/... on the gateway.
+export const SERVICE_API_PATH_PREFIX = "/api/service";
 const DEFAULT_MAX_AGE_SECONDS = 60;
 const DEFAULT_CLOCK_TOLERANCE_SECONDS = 5;
 const DEFAULT_TOKEN_TTL_SECONDS = 60;
@@ -185,9 +187,6 @@ function buildTokenClaims(input) {
     if (!Number.isFinite(input.ttlSeconds) || input.ttlSeconds <= 0) {
         throw new Error("Gateway token ttlSeconds must be a positive number.");
     }
-    if (auth.scopes !== undefined && !isStringArray(auth.scopes)) {
-        throw new Error("Gateway token scopes must be strings.");
-    }
     const claims = {
         aud: input.tool,
         authMethod: auth.method,
@@ -205,8 +204,8 @@ function buildTokenClaims(input) {
         if (user) {
             throw new Error("Service gateway tokens cannot carry a user.");
         }
+        // Service tokens carry no scopes: providers decide access with allowedCallers.
         claims.callerTool = auth.callerTool;
-        claims.scopes = [...(auth.scopes ?? [])];
         if (auth.clientId !== undefined) {
             claims.clientId = auth.clientId;
         }
@@ -220,6 +219,9 @@ function buildTokenClaims(input) {
     }
     if (auth.callerTool) {
         throw new Error("Only service gateway tokens can carry auth.callerTool.");
+    }
+    if (auth.scopes !== undefined && !isStringArray(auth.scopes)) {
+        throw new Error("Gateway token scopes must be strings.");
     }
     claims.email = user.email;
     claims.name = user.name ?? null;
@@ -431,9 +433,8 @@ function toTokenPayload(claims) {
     }
     const clientId = claims.clientId;
     if (claims.authMethod === "service") {
-        if (!isNonEmptyString(claims.callerTool) ||
-            !isStringArray(claims.scopes) ||
-            claims.email !== undefined) {
+        // Tokens from v0.3 gateways may still carry a "scopes" claim; it is accepted but not exposed.
+        if (!isNonEmptyString(claims.callerTool) || claims.email !== undefined) {
             return null;
         }
         return {
@@ -443,7 +444,6 @@ function toTokenPayload(claims) {
             host: base.host,
             iat: base.iat,
             path: base.path,
-            scopes: [...claims.scopes],
             tool: base.tool,
             version: GATEWAY_TOKEN_VERSION,
         };
@@ -587,9 +587,18 @@ export async function requireGatewayHeaders(headers, input) {
     }
     return payload;
 }
-// For service APIs: accepts only v2 service tokens addressed to this tool. Throws
-// GatewayAuthError with reason "unauthenticated" (401) or "forbidden" (403).
+const ALLOWED_CALLERS_ERROR = 'allowedCallers is required: list the tool slugs allowed to call this endpoint, e.g. allowedCallers: ["crm"]';
+// For service APIs: accepts only v2 service tokens addressed to this tool, from a tool listed in
+// allowedCallers. Throws GatewayAuthError with reason "unauthenticated" (401) or "forbidden"
+// (403), and a plain Error for configuration bugs such as a missing allowedCallers.
 export async function requireServiceCaller(headers, input) {
+    // Checked before any verification so a missing allowlist fails on the very first request.
+    const allowedCallers = input?.allowedCallers;
+    if (!Array.isArray(allowedCallers) ||
+        allowedCallers.length === 0 ||
+        !allowedCallers.every(isNonEmptyString)) {
+        throw new Error(ALLOWED_CALLERS_ERROR);
+    }
     const payload = await verifyGatewayToken(headers, input);
     if (!payload) {
         throw new GatewayAuthError("Missing or invalid gateway service token.", "unauthenticated");
@@ -597,12 +606,8 @@ export async function requireServiceCaller(headers, input) {
     if (payload.authMethod !== "service") {
         throw new GatewayAuthError("This endpoint only accepts service callers.", "forbidden");
     }
-    if (input.allowedCallers && !input.allowedCallers.includes(payload.callerTool)) {
+    if (!allowedCallers.includes(payload.callerTool)) {
         throw new GatewayAuthError(`Tool "${payload.callerTool}" may not call this endpoint.`, "forbidden");
-    }
-    const missing = (input.requiredScopes ?? []).filter((scope) => !payload.scopes.includes(scope));
-    if (missing.length > 0) {
-        throw new GatewayAuthError(`Missing required scopes: ${missing.join(", ")}.`, "forbidden");
     }
     return payload;
 }
@@ -615,15 +620,6 @@ function normalizeGatewayOrigin(value) {
         throw new Error("gatewayOrigin must be an origin without a path, e.g. https://gateway.example.com.");
     }
     return url.origin;
-}
-function normalizeServicePath(value) {
-    if (!/^(\/[A-Za-z0-9._~-]+)+\/?$/.test(value) || hasDotSegment(value)) {
-        throw new Error('servicePath must be an absolute path such as "/api/service".');
-    }
-    return value.replace(/\/$/, "");
-}
-function hasDotSegment(path) {
-    return path.split("/").some((segment) => /^(\.|%2e){1,2}$/i.test(segment));
 }
 const PATH_ERROR = 'Tool client paths must start with "/" and stay inside the service API.';
 // Mirrors the gateway, which answers 404 for service paths an upstream could read differently
@@ -677,8 +673,26 @@ function resolveServiceUrl(baseUrl, path) {
     }
     return url.href;
 }
-function hasInsufficientScopeChallenge(response) {
-    return /\berror\s*=\s*"?insufficient_scope"?/i.test(response.headers.get("www-authenticate") ?? "");
+// The gateway redirects requests it does not treat as service calls (e.g. to its login page).
+// Following that would hand the caller an HTML page with a 200, so any redirect is an error.
+// 304 is not a redirect: it answers the caller's own conditional request.
+async function assertNotRedirected(response, origin, targetTool) {
+    const opaque = response.type === "opaqueredirect";
+    if (!opaque && (response.status < 300 || response.status > 399 || response.status === 304)) {
+        return;
+    }
+    let target = "";
+    try {
+        const location = response.headers.get("location");
+        // Path only: the query string could carry anything, including tokens.
+        target = location ? ` to ${new URL(location, origin).pathname}` : "";
+    }
+    catch {
+        target = "";
+    }
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`The gateway redirected the request (${opaque ? "opaque redirect" : `HTTP ${response.status}`}${target}). ` +
+        `Check that "${targetTool}" is a registered, enabled tool and that this call runs on the server.`);
 }
 function isReplayableBody(body) {
     return !(typeof ReadableStream !== "undefined" && body instanceof ReadableStream);
@@ -687,29 +701,24 @@ async function readTokenError(response) {
     try {
         const body = await response.json();
         if (isRecord(body) && typeof body.error === "string") {
-            return {
-                code: body.error,
-                message: typeof body.error_description === "string"
-                    ? `${body.error}: ${body.error_description}`
-                    : body.error,
-            };
+            return typeof body.error_description === "string"
+                ? `${body.error}: ${body.error_description}`
+                : body.error;
         }
     }
     catch {
         // Fall through to the status-only message.
     }
-    return { code: "unknown_error", message: "unknown_error" };
+    return "unknown_error";
 }
 export function createToolClient(options) {
     const origin = normalizeGatewayOrigin(options.gatewayOrigin);
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(options.targetTool)) {
         throw new Error("targetTool must be a tool slug.");
     }
-    const servicePath = normalizeServicePath(options.servicePath ?? "/api/service");
-    const baseUrl = `${origin}/${options.targetTool}${servicePath}`;
+    const baseUrl = `${origin}/${options.targetTool}${SERVICE_API_PATH_PREFIX}`;
     const fetchImpl = options.fetch ?? ((...args) => fetch(...args));
     const now = options.now ?? Date.now;
-    const scope = Array.isArray(options.scope) ? options.scope.join(" ") : options.scope;
     let cached = null;
     let inFlight = null;
     async function requestAccessToken() {
@@ -720,9 +729,6 @@ export function createToolClient(options) {
             grant_type: "client_credentials",
             resource: baseUrl,
         });
-        if (scope) {
-            body.set("scope", scope);
-        }
         const response = await fetchImpl(`${origin}/oauth/token`, {
             body,
             headers: {
@@ -730,14 +736,11 @@ export function createToolClient(options) {
                 "content-type": "application/x-www-form-urlencoded",
             },
             method: "POST",
+            redirect: "manual",
         });
+        await assertNotRedirected(response, origin, options.targetTool);
         if (!response.ok) {
-            const error = await readTokenError(response);
-            // Typically after the provider narrowed this tool's scopes.
-            const hint = error.code === "invalid_scope"
-                ? ` The requested scope${scope ? ` "${scope}"` : ""} is not granted to this tool.`
-                : "";
-            throw new Error(`Gateway token request failed (HTTP ${response.status}): ${error.message}.${hint}`);
+            throw new Error(`Gateway token request failed (HTTP ${response.status}): ${await readTokenError(response)}.`);
         }
         const json = await response.json().catch(() => null);
         if (!isRecord(json) ||
@@ -770,7 +773,10 @@ export function createToolClient(options) {
     async function send(url, init, token) {
         const headers = new Headers(init?.headers);
         headers.set("authorization", `Bearer ${token}`);
-        return fetchImpl(url, { ...init, headers });
+        // Set after the caller's init so it cannot be overridden.
+        const response = await fetchImpl(url, { ...init, headers, redirect: "manual" });
+        await assertNotRedirected(response, origin, options.targetTool);
+        return response;
     }
     // Only drops the cache if it still holds this token, not a newer one from another refresh.
     function evict(token) {
@@ -783,12 +789,6 @@ export function createToolClient(options) {
             const url = resolveServiceUrl(baseUrl, path);
             const token = await getAccessToken();
             const response = await send(url, init, token);
-            // The provider narrowed this tool's scopes: the next call fetches a token with the scopes
-            // still granted (or fails with invalid_scope if an explicit scope is no longer granted).
-            if (response.status === 403 && hasInsufficientScopeChallenge(response)) {
-                evict(token);
-                return response;
-            }
             if (response.status !== 401) {
                 return response;
             }

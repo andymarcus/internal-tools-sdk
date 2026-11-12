@@ -11,7 +11,7 @@ In the examples below, replace `https://<gateway>` with your gateway's origin.
 ## Install from GitHub
 
 ```bash
-npm install github:andymarcus/internal-tools-sdk#v0.3.0
+npm install github:andymarcus/internal-tools-sdk#v0.4.0
 ```
 
 ## Verifying requests (recommended)
@@ -99,9 +99,19 @@ if (user.authMethod === "oauth" && !user.scopes?.includes("write")) {
 
 ## Service APIs
 
-Tools can expose endpoints for other tools under `/api/service/...`. The gateway checks the caller's identity and forwards a v2 token with `authMethod: "service"`, the calling tool's slug in `callerTool`, and the granted `scopes`.
+A service API lets one tool's backend call another tool directly, with no person signed in. For example, `other-tool` can ask `example-tool` for a list of orders. Every request goes through the gateway, which checks which tool is calling and passes that on to the tool being called.
+
+- The tool being called is the **provider**. Its service API lives under `/api/service/...`.
+- The tool making the call is the **caller**.
+- Access is decided in the provider's code: each route lists the tools allowed to call it.
 
 ### Providing a service API
+
+Nothing to set up in the gateway: any route under `/api/service/` is a service API.
+
+1. Create your routes under `app/api/service/...` (Next.js) or `api/service/...` (plain Vercel Functions).
+2. Start each route with `requireServiceCaller`, listing the tools allowed to call it in `allowedCallers`. It is required: without it, the route throws an error on its first request.
+3. Return the status from `GatewayAuthError`: `401` when there is no valid gateway token, `403` when the calling tool is not in `allowedCallers`.
 
 ```ts
 // app/api/service/orders/route.ts
@@ -110,15 +120,15 @@ import { GatewayAuthError, requireServiceCaller } from "@meandu/internal-tools-s
 export async function GET(request: Request) {
   try {
     const caller = await requireServiceCaller(request.headers, {
-      ...gateway,
+      tool: "example-tool", // your tool's slug
+      jwksUrl: "https://<gateway>/.well-known/gateway-jwks.json",
+      issuer: "https://<gateway>",
       allowedCallers: ["other-tool"],
-      requiredScopes: ["orders:read"],
     });
 
-    return Response.json({ orders: [], caller: caller.callerTool });
+    return Response.json({ orders: [], calledBy: caller.callerTool });
   } catch (error) {
     if (error instanceof GatewayAuthError) {
-      // 401 for a missing or invalid token, 403 for the wrong caller or missing scopes.
       return Response.json({ error: error.reason }, { status: error.status });
     }
 
@@ -127,9 +137,39 @@ export async function GET(request: Request) {
 }
 ```
 
+**Paste this into your AI coding assistant** (replace `https://<gateway>` with your gateway's origin first):
+
+```text
+Add a service API to this app so other internal tools can call it through the internal tools
+gateway (https://<gateway>).
+- Install the SDK: npm install github:andymarcus/internal-tools-sdk#v0.4.0
+- Put each endpoint under app/api/service/... (Next.js) or api/service/... (plain Vercel
+  Functions). Do not put user-facing pages there.
+- Start every handler with requireServiceCaller(request.headers, { tool: "<my-tool-slug>",
+  jwksUrl: "https://<gateway>/.well-known/gateway-jwks.json", issuer: "https://<gateway>",
+  allowedCallers: ["<calling-tool-slug>"] }) from "@meandu/internal-tools-sdk".
+- Catch GatewayAuthError and return JSON { error: error.reason } with status error.status (401
+  or 403). Rethrow any other error.
+- Use caller.callerTool if the endpoint needs to know which tool called it.
+The endpoint I need: <describe what it should return or do>.
+```
+
 ### Calling another tool
 
-On Vercel, the calling tool authenticates with its deployment's OIDC token. Tokens are cached until 30 seconds before they expire, and a `401` is retried once with a fresh token. Create the client once at module scope, but call `fetch` inside a route handler or server action: `getVercelOidcToken()` reads the token from the request context.
+Before your tool can call a service API:
+
+- It must be registered in the gateway, and deployed on the team's Vercel account.
+- Its Vercel project must use OIDC Federation in **Team** issuer mode (the default for new projects).
+- Calls only work from the **production** deployment. Preview and local builds are refused.
+- The provider must list your tool's slug in `allowedCallers`.
+
+Install `@vercel/oidc` 4.0.9 or later and this SDK:
+
+```bash
+npm install @vercel/oidc@^4.0.9 github:andymarcus/internal-tools-sdk#v0.4.0
+```
+
+Create the client once, then call `fetch` inside a route handler or server action: `getVercelOidcToken()` reads your deployment's token from the incoming request.
 
 ```ts
 // lib/example-tool.ts
@@ -138,22 +178,38 @@ import { createToolClient } from "@meandu/internal-tools-sdk";
 
 export const exampleTool = createToolClient({
   gatewayOrigin: "https://<gateway>",
-  targetTool: "example-tool",
+  targetTool: "example-tool", // the provider's slug
   getOidcToken: getVercelOidcToken,
-  scope: ["orders:read"],
 });
 
 // app/api/orders/route.ts
 import { exampleTool } from "@/lib/example-tool";
 
 export async function GET() {
-  // GET https://<gateway>/example-tool/api/service/orders?limit=10
+  // Calls https://<gateway>/example-tool/api/service/orders?limit=10
   const response = await exampleTool.fetch("/orders?limit=10");
   return Response.json(await response.json(), { status: response.status });
 }
 ```
 
-Paths must start with `/` and cannot leave the target tool's service API. If the provider narrows this tool's scopes, the gateway answers `403` with `error="insufficient_scope"`. The client then drops its cached token, so the next call gets one with the scopes still granted. If an explicit `scope` is no longer granted, the next token request fails with `invalid_scope`.
+The client caches its gateway token and retries once with a fresh token on a `401`. Paths start with `/` and are relative to the provider's `/api/service`. A `403` means the provider has not listed your tool in `allowedCallers`. The client never follows redirects: if the gateway redirects a call (for example to its login page), `fetch` throws an error saying so.
+
+**Paste this into your AI coding assistant** (replace `https://<gateway>` with your gateway's origin first):
+
+```text
+Call the "<provider-slug>" internal tool's service API from this app's backend through the
+internal tools gateway (https://<gateway>).
+- Install: npm install @vercel/oidc@^4.0.9 github:andymarcus/internal-tools-sdk#v0.4.0
+- In lib/<provider-slug>.ts, create and export a client with createToolClient({ gatewayOrigin:
+  "https://<gateway>", targetTool: "<provider-slug>", getOidcToken: getVercelOidcToken }) from
+  "@meandu/internal-tools-sdk" and "@vercel/oidc".
+- Only call client.fetch("/<path>") inside a route handler or server action, never at module
+  top level or in client components. Paths are relative to the provider's /api/service.
+- Handle non-2xx responses: 401 means the gateway rejected this deployment, 403 means the
+  provider has not allowed this tool.
+- This only works on the production deployment on Vercel.
+The endpoint I need: <path and what to do with the result>.
+```
 
 ## Direct-access protection
 
@@ -177,7 +233,7 @@ export default nextConfig;
 
 - Use HTTPS for gateway and downstream traffic.
 - Always pass `tool` so identities signed for another tool are rejected.
-- Only accept service callers (`allowService: true` or `requireServiceCaller`) on endpoints meant for other tools, and list the callers you expect in `allowedCallers`.
+- Only accept service callers on endpoints meant for other tools: use `requireServiceCaller` with the callers you expect in `allowedCallers`.
 - Avoid logging `x-meandu-gateway-token`, `x-meandu-gateway-payload` or `x-meandu-gateway-signature`.
 - While you still use the shared secret, keep `INTERNAL_AUTH_SHARED_SECRET` out of source control, share it through an approved secrets manager, and rotate it if it is exposed. Remove it once the gateway sends v2 everywhere.
 
@@ -197,11 +253,11 @@ Verifies only the v2 token (`tool` and `jwksUrl` or `jwks` are required). Return
 
 ### `requireServiceCaller(headers, options)`
 
-Verifies a v2 service token and returns the service payload. Throws `GatewayAuthError` with status 401 for a missing or invalid token, and 403 for a user identity, a caller not in `allowedCallers`, or missing `requiredScopes`.
+Verifies a v2 service token and returns the service payload (`callerTool`, `tool`, `host`, `path`, `iat`). `allowedCallers` (a non-empty list of tool slugs) is required; without it, it throws a plain `Error` before checking anything. Throws `GatewayAuthError` with status 401 for a missing or invalid token, and 403 for a user identity or a caller not in `allowedCallers`.
 
 ### `createToolClient(options)`
 
-Returns `{ fetch(path, init?), getAccessToken() }` for calling another tool's service API through the gateway. Options: `gatewayOrigin`, `targetTool`, `getOidcToken`, and optionally `scope`, `servicePath` (default `/api/service`) and `fetch`.
+Returns `{ fetch(path, init?), getAccessToken() }` for calling another tool's service API through the gateway. Options: `gatewayOrigin`, `targetTool`, `getOidcToken`, and optionally `fetch`. Requests go to `/<targetTool>/api/service/...` (`SERVICE_API_PATH_PREFIX`). Redirects are never followed and throw an error.
 
 ### Gateway side: `createGatewayToken`, `createGatewayRequestHeaders`, `createGatewayHeaders`
 
