@@ -2,23 +2,21 @@
 
 Helpers for me&u internal tools that sit behind the central internal tools gateway.
 
-The gateway authenticates users once with Google SSO, then forwards signed identity headers to downstream tools. This SDK verifies those headers so a downstream app can reject direct traffic that bypasses the gateway.
+The gateway authenticates users once with Google SSO, then forwards a signed identity with each request to downstream tools. This SDK verifies that identity so a downstream app can reject direct traffic that bypasses the gateway. It also lets a tool's backend call another tool's service API through the gateway.
+
+Zero dependencies: WebCrypto and `fetch` only, so it runs on Node 22+ and edge runtimes.
+
+In the examples below, replace `https://<gateway>` with your gateway's origin.
 
 ## Install from GitHub
 
 ```bash
-npm install github:andymarcus/internal-tools-sdk#v0.2.0
+npm install github:andymarcus/internal-tools-sdk#v0.3.0
 ```
 
-## Required environment variable
+## Verifying requests (recommended)
 
-```env
-INTERNAL_AUTH_SHARED_SECRET=
-```
-
-This value must match the secret configured in the gateway. Do not commit it to GitHub.
-
-## Next.js usage
+Since 0.3.0 the gateway signs each request with an ES256 token (`x-meandu-gateway-token`, "v2") that tools verify against the gateway's public keys. No shared secret is needed.
 
 Create a helper in the downstream app:
 
@@ -26,10 +24,14 @@ Create a helper in the downstream app:
 import { headers } from "next/headers";
 import { requireGatewayHeaders } from "@meandu/internal-tools-sdk";
 
+const gateway = {
+  tool: "example-tool", // this tool's slug; tokens for other tools are rejected
+  jwksUrl: "https://<gateway>/.well-known/gateway-jwks.json",
+  issuer: "https://<gateway>",
+};
+
 export async function requireInternalToolUser() {
-  return requireGatewayHeaders(await headers(), {
-    secret: process.env.INTERNAL_AUTH_SHARED_SECRET!,
-  });
+  return requireGatewayHeaders(await headers(), gateway);
 }
 ```
 
@@ -47,14 +49,43 @@ export default async function Page() {
 }
 ```
 
-## MCP and OAuth calls
+Keys are fetched once and cached in memory. An unknown key id triggers at most one refetch per 30 seconds, and the tool fails closed if the keys cannot be fetched.
 
-Since 0.2.0 the gateway payload also says how the gateway authenticated the request:
+`requireGatewayHeaders` throws `GatewayAuthError` (`reason: "unauthenticated"`, `status: 401`) when the request has no valid identity. `verifyGatewayHeaders` returns `null` instead. Both throw a plain `Error` for configuration bugs, such as `jwksUrl` without `tool`.
 
-- `authMethod: "session"`: a person using the tool in their browser through Google SSO.
-- `authMethod: "oauth"`: an MCP client (such as Claude) calling the tool's MCP endpoint with a gateway-issued access token on the user's behalf. `clientId` identifies the client and `scopes` lists the OAuth scopes the user granted.
+## Migrating from the shared secret
 
-Payloads from gateways older than 0.2.0 have no `authMethod`. Treat that as a browser session. The gateway never forwards the client's access token, so the tool only ever sees the signed headers.
+Before 0.3.0, tools verified HMAC headers ("v1") with a shared secret:
+
+```env
+INTERNAL_AUTH_SHARED_SECRET=
+```
+
+The gateway sends both the v1 headers and the v2 token while tools migrate.
+
+1. Add `tool`, `jwksUrl` and `issuer`, and keep `secret` for now:
+
+   ```ts
+   requireGatewayHeaders(await headers(), {
+     ...gateway,
+     secret: process.env.INTERNAL_AUTH_SHARED_SECRET,
+   });
+   ```
+
+   When the v2 token is present, only v2 is checked (a bad token never falls back to v1). Requests without it, from an older gateway, are checked with the secret.
+2. Once the gateway sends v2 everywhere, remove `secret` and the env var.
+
+Secret-only calls (`{ secret }`) still work as before. Pass `tool` too so payloads signed for another tool are rejected.
+
+## Who is calling
+
+The payload's `authMethod` says how the gateway authenticated the request:
+
+- `"session"`: a person using the tool in their browser through Google SSO.
+- `"oauth"`: an MCP client (such as Claude) calling the tool's MCP endpoint with a gateway-issued access token on the user's behalf. `clientId` identifies the client and `scopes` lists what the user granted.
+- `"service"`: another tool's backend calling as itself, with no user. See below.
+
+v1 payloads from gateways older than 0.2.0 have no `authMethod`. Treat that as a browser session. The gateway never forwards the caller's access token, so the tool only ever sees the signed identity.
 
 ```ts
 const user = await requireInternalToolUser();
@@ -64,9 +95,62 @@ if (user.authMethod === "oauth" && !user.scopes?.includes("write")) {
 }
 ```
 
+`verifyGatewayHeaders` and `requireGatewayHeaders` reject service callers unless you pass `allowService: true`, so user-facing pages never mistake a tool for a person.
+
+## Service APIs
+
+Tools can expose endpoints for other tools under `/api/service/...`. The gateway checks the caller's identity and forwards a v2 token with `authMethod: "service"`, the calling tool's slug in `callerTool`, and the granted `scopes`.
+
+### Providing a service API
+
+```ts
+// app/api/service/orders/route.ts
+import { GatewayAuthError, requireServiceCaller } from "@meandu/internal-tools-sdk";
+
+export async function GET(request: Request) {
+  try {
+    const caller = await requireServiceCaller(request.headers, {
+      ...gateway,
+      allowedCallers: ["other-tool"],
+      requiredScopes: ["orders:read"],
+    });
+
+    return Response.json({ orders: [], caller: caller.callerTool });
+  } catch (error) {
+    if (error instanceof GatewayAuthError) {
+      // 401 for a missing or invalid token, 403 for the wrong caller or missing scopes.
+      return Response.json({ error: error.reason }, { status: error.status });
+    }
+
+    throw error;
+  }
+}
+```
+
+### Calling another tool
+
+On Vercel, the calling tool authenticates with its deployment's OIDC token. Tokens are cached until 30 seconds before they expire, and a `401` is retried once with a fresh token.
+
+```ts
+import { getVercelOidcToken } from "@vercel/oidc";
+import { createToolClient } from "@meandu/internal-tools-sdk";
+
+const orders = createToolClient({
+  gatewayOrigin: "https://<gateway>",
+  targetTool: "example-tool",
+  getOidcToken: getVercelOidcToken,
+  scope: ["orders:read"],
+});
+
+// GET https://<gateway>/example-tool/api/service/orders?limit=10
+const response = await orders.fetch("/orders?limit=10");
+```
+
+Paths must start with `/` and cannot leave the target tool's service API.
+
 ## Direct-access protection
 
-Downstream apps should reject requests that do not include valid gateway headers. This prevents someone from opening the downstream deployment URL directly and bypassing the gateway.
+Downstream apps should reject requests that do not carry a valid gateway identity. This prevents someone from opening the downstream deployment URL directly and bypassing the gateway.
 
 ## Next.js base path
 
@@ -84,29 +168,34 @@ export default nextConfig;
 
 ## Security notes
 
-- Keep `INTERNAL_AUTH_SHARED_SECRET` out of source control.
-- Share the secret through an approved secrets manager.
 - Use HTTPS for gateway and downstream traffic.
-- Avoid logging `x-meandu-gateway-payload` or `x-meandu-gateway-signature`.
-- Rotate the shared secret if it is exposed.
+- Always pass `tool` so identities signed for another tool are rejected.
+- Only accept service callers (`allowService: true` or `requireServiceCaller`) on endpoints meant for other tools, and list the callers you expect in `allowedCallers`.
+- Avoid logging `x-meandu-gateway-token`, `x-meandu-gateway-payload` or `x-meandu-gateway-signature`.
+- While you still use the shared secret, keep `INTERNAL_AUTH_SHARED_SECRET` out of source control, share it through an approved secrets manager, and rotate it if it is exposed. Remove it once the gateway sends v2 everywhere.
 
 ## API
 
 ### `requireGatewayHeaders(headers, options)`
 
-Verifies the signed gateway headers and returns the gateway payload. Throws `GatewayAuthError` when headers are missing, expired, or invalid.
-
-```ts
-const user = await requireGatewayHeaders(headers, {
-  secret: process.env.INTERNAL_AUTH_SHARED_SECRET!,
-  maxAgeSeconds: 60,
-});
-```
+Verifies the gateway identity and returns the payload. Throws `GatewayAuthError` when it is missing, expired, or invalid. Options: `tool`, `jwksUrl` or `jwks`, `issuer`, `secret` (v1), `allowService`, `maxAgeSeconds`, `clockToleranceSeconds`.
 
 ### `verifyGatewayHeaders(headers, options)`
 
-Verifies the signed gateway headers and returns the gateway payload, or `null` when headers are missing, expired, or invalid.
+Same as `requireGatewayHeaders`, but returns `null` instead of throwing.
 
-### `createGatewayHeaders(input)`
+### `verifyGatewayToken(headers, options)`
 
-Creates signed gateway headers. This is primarily for the gateway app itself and for tests.
+Verifies only the v2 token (`tool` and `jwksUrl` or `jwks` are required). Returns the payload, including service payloads, or `null`.
+
+### `requireServiceCaller(headers, options)`
+
+Verifies a v2 service token and returns the service payload. Throws `GatewayAuthError` with status 401 for a missing or invalid token, and 403 for a user identity, a caller not in `allowedCallers`, or missing `requiredScopes`.
+
+### `createToolClient(options)`
+
+Returns `{ fetch(path, init?), getAccessToken() }` for calling another tool's service API through the gateway. Options: `gatewayOrigin`, `targetTool`, `getOidcToken`, and optionally `scope`, `servicePath` (default `/api/service`) and `fetch`.
+
+### Gateway side: `createGatewayToken`, `createGatewayRequestHeaders`, `createGatewayHeaders`
+
+Used by the gateway app itself and in tests. `createGatewayToken` signs a v2 token with an ECDSA P-256 private key. `createGatewayRequestHeaders` builds v1 and v2 headers together and never builds v1 for service calls. `createGatewayHeaders` builds v1 headers only.
