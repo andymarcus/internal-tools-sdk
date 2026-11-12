@@ -375,23 +375,29 @@ async function getRemoteKey(url, kid, fetchImpl, now) {
         entry = { fetchedAt: 0, inFlight: null, jwks: null, keys: new Map(), lastAttemptAt: 0 };
         remoteJwksCache.set(url, entry);
     }
-    const canRefetch = now - entry.lastAttemptAt >= JWKS_REFETCH_INTERVAL_MS;
-    if (!entry.jwks) {
-        // Nothing cached yet: fetch (deduped across concurrent requests). Fails closed on error.
-        await refreshRemoteJwks(entry, url, fetchImpl, now);
+    const remote = entry;
+    const isStale = () => !remote.jwks || now - remote.fetchedAt >= JWKS_CACHE_TTL_MS;
+    // Concurrent callers always join an in-flight fetch; new fetches wait out the cooldown.
+    const canFetch = () => Boolean(remote.inFlight) || now - remote.lastAttemptAt >= JWKS_REFETCH_INTERVAL_MS;
+    if (isStale()) {
+        // Nothing cached, or cached past its TTL: a refresh is mandatory so revoked keys drop out.
+        if (canFetch()) {
+            await refreshRemoteJwks(remote, url, fetchImpl, now);
+        }
+        // Fail closed when the gateway's keys cannot be (re)fetched.
+        if (isStale()) {
+            return null;
+        }
     }
-    else if (now - entry.fetchedAt >= JWKS_CACHE_TTL_MS && canRefetch) {
-        // Stale cache: refresh so revoked keys drop out. Keep the old keys if the gateway is down.
-        await refreshRemoteJwks(entry, url, fetchImpl, now);
-    }
-    const found = lookupKey(entry.keys, entry.jwks, kid);
+    const found = lookupKey(remote.keys, remote.jwks, kid);
     if (found) {
         return found;
     }
-    // Unknown kid, probably a key rotation. Refetch at most once per interval per URL.
-    if (entry.jwks && now - entry.lastAttemptAt >= JWKS_REFETCH_INTERVAL_MS) {
-        await refreshRemoteJwks(entry, url, fetchImpl, now);
-        return lookupKey(entry.keys, entry.jwks, kid);
+    // Unknown kid, probably a key rotation. Refetch at most once per interval per URL. Fresh
+    // cached keys keep working if this refetch fails.
+    if (canFetch()) {
+        await refreshRemoteJwks(remote, url, fetchImpl, now);
+        return lookupKey(remote.keys, remote.jwks, kid);
     }
     return null;
 }
@@ -619,14 +625,31 @@ function normalizeServicePath(value) {
 function hasDotSegment(path) {
     return path.split("/").some((segment) => /^(\.|%2e){1,2}$/i.test(segment));
 }
+const PATH_ERROR = 'Tool client paths must start with "/" and stay inside the service API.';
 function assertRelativeServicePath(path) {
     if (typeof path !== "string" ||
+        // URL parsing silently strips tabs and newlines, which could hide a "..".
+        /[\u0000-\u001f\u007f]/.test(path) ||
         !path.startsWith("/") ||
         path.startsWith("//") ||
         path.includes("\\") ||
         hasDotSegment(path.split(/[?#]/, 1)[0])) {
-        throw new Error('Tool client paths must start with "/" and stay inside the service API.');
+        throw new Error(PATH_ERROR);
     }
+}
+// Builds the final URL and checks the parser's normalized result, not just the raw input.
+function resolveServiceUrl(baseUrl, path) {
+    assertRelativeServicePath(path);
+    const base = new URL(baseUrl);
+    const url = new URL(`${baseUrl}${path}`);
+    if (url.origin !== base.origin ||
+        (url.pathname !== base.pathname && !url.pathname.startsWith(`${base.pathname}/`))) {
+        throw new Error(PATH_ERROR);
+    }
+    return url.href;
+}
+function hasInsufficientScopeChallenge(response) {
+    return /\berror\s*=\s*"?insufficient_scope"?/i.test(response.headers.get("www-authenticate") ?? "");
 }
 function isReplayableBody(body) {
     return !(typeof ReadableStream !== "undefined" && body instanceof ReadableStream);
@@ -635,15 +658,18 @@ async function readTokenError(response) {
     try {
         const body = await response.json();
         if (isRecord(body) && typeof body.error === "string") {
-            return typeof body.error_description === "string"
-                ? `${body.error}: ${body.error_description}`
-                : body.error;
+            return {
+                code: body.error,
+                message: typeof body.error_description === "string"
+                    ? `${body.error}: ${body.error_description}`
+                    : body.error,
+            };
         }
     }
     catch {
         // Fall through to the status-only message.
     }
-    return "unknown_error";
+    return { code: "unknown_error", message: "unknown_error" };
 }
 export function createToolClient(options) {
     const origin = normalizeGatewayOrigin(options.gatewayOrigin);
@@ -677,7 +703,12 @@ export function createToolClient(options) {
             method: "POST",
         });
         if (!response.ok) {
-            throw new Error(`Gateway token request failed (HTTP ${response.status}): ${await readTokenError(response)}.`);
+            const error = await readTokenError(response);
+            // Typically after the provider narrowed this tool's scopes.
+            const hint = error.code === "invalid_scope"
+                ? ` The requested scope${scope ? ` "${scope}"` : ""} is not granted to this tool.`
+                : "";
+            throw new Error(`Gateway token request failed (HTTP ${response.status}): ${error.message}.${hint}`);
         }
         const json = await response.json().catch(() => null);
         if (!isRecord(json) ||
@@ -712,20 +743,33 @@ export function createToolClient(options) {
         headers.set("authorization", `Bearer ${token}`);
         return fetchImpl(url, { ...init, headers });
     }
+    // Only drops the cache if it still holds this token, not a newer one from another refresh.
+    function evict(token) {
+        if (cached?.token === token) {
+            cached = null;
+        }
+    }
     return {
         async fetch(path, init) {
-            assertRelativeServicePath(path);
-            const url = `${baseUrl}${path}`;
+            const url = resolveServiceUrl(baseUrl, path);
             const token = await getAccessToken();
             const response = await send(url, init, token);
-            if (response.status !== 401 || !isReplayableBody(init?.body)) {
+            // The provider narrowed this tool's scopes: the next call fetches a token with the scopes
+            // still granted (or fails with invalid_scope if an explicit scope is no longer granted).
+            if (response.status === 403 && hasInsufficientScopeChallenge(response)) {
+                evict(token);
+                return response;
+            }
+            if (response.status !== 401) {
+                return response;
+            }
+            evict(token);
+            // A streamed body cannot be sent twice, so hand the 401 back to the caller.
+            if (!isReplayableBody(init?.body)) {
                 return response;
             }
             // The token may have been revoked or the gateway's keys rotated: retry once with a new one.
             await response.body?.cancel().catch(() => undefined);
-            if (cached?.token === token) {
-                cached = null;
-            }
             return send(url, init, await getAccessToken());
         },
         getAccessToken,

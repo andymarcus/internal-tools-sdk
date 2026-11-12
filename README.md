@@ -129,24 +129,31 @@ export async function GET(request: Request) {
 
 ### Calling another tool
 
-On Vercel, the calling tool authenticates with its deployment's OIDC token. Tokens are cached until 30 seconds before they expire, and a `401` is retried once with a fresh token.
+On Vercel, the calling tool authenticates with its deployment's OIDC token. Tokens are cached until 30 seconds before they expire, and a `401` is retried once with a fresh token. Create the client once at module scope, but call `fetch` inside a route handler or server action: `getVercelOidcToken()` reads the token from the request context.
 
 ```ts
+// lib/example-tool.ts
 import { getVercelOidcToken } from "@vercel/oidc";
 import { createToolClient } from "@meandu/internal-tools-sdk";
 
-const orders = createToolClient({
+export const exampleTool = createToolClient({
   gatewayOrigin: "https://<gateway>",
   targetTool: "example-tool",
   getOidcToken: getVercelOidcToken,
   scope: ["orders:read"],
 });
 
-// GET https://<gateway>/example-tool/api/service/orders?limit=10
-const response = await orders.fetch("/orders?limit=10");
+// app/api/orders/route.ts
+import { exampleTool } from "@/lib/example-tool";
+
+export async function GET() {
+  // GET https://<gateway>/example-tool/api/service/orders?limit=10
+  const response = await exampleTool.fetch("/orders?limit=10");
+  return Response.json(await response.json(), { status: response.status });
+}
 ```
 
-Paths must start with `/` and cannot leave the target tool's service API.
+Paths must start with `/` and cannot leave the target tool's service API. If the provider narrows this tool's scopes, the gateway answers `403` with `error="insufficient_scope"`. The client then drops its cached token, so the next call gets one with the scopes still granted. If an explicit `scope` is no longer granted, the next token request fails with `invalid_scope`.
 
 ## Direct-access protection
 
