@@ -1084,7 +1084,14 @@ function hasAmbiguousSegments(pathname: string) {
       return true;
     }
 
-    return decoded === "." || decoded === ".." || decoded.includes("/") || decoded.includes("\\");
+    // A decoded ";" ("%3B") also counts: lenient upstreams read "..;" as "..".
+    return (
+      decoded === "." ||
+      decoded === ".." ||
+      decoded.includes("/") ||
+      decoded.includes("\\") ||
+      decoded.includes(";")
+    );
   });
 }
 

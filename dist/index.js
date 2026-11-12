@@ -645,7 +645,12 @@ function hasAmbiguousSegments(pathname) {
         catch {
             return true;
         }
-        return decoded === "." || decoded === ".." || decoded.includes("/") || decoded.includes("\\");
+        // A decoded ";" ("%3B") also counts: lenient upstreams read "..;" as "..".
+        return (decoded === "." ||
+            decoded === ".." ||
+            decoded.includes("/") ||
+            decoded.includes("\\") ||
+            decoded.includes(";"));
     });
 }
 function assertRelativeServicePath(path) {
