@@ -626,15 +626,39 @@ function hasDotSegment(path) {
     return path.split("/").some((segment) => /^(\.|%2e){1,2}$/i.test(segment));
 }
 const PATH_ERROR = 'Tool client paths must start with "/" and stay inside the service API.';
+// Mirrors the gateway, which answers 404 for service paths an upstream could read differently
+// once decoded: dot segments (literal or encoded), encoded "/" or "\", empty segments ("//"),
+// ";" path parameters and malformed percent-encoding. A trailing slash is fine.
+function hasAmbiguousSegments(pathname) {
+    const segments = pathname.split("/").slice(1);
+    return segments.some((segment, index) => {
+        if (!segment) {
+            return index !== segments.length - 1;
+        }
+        if (segment.includes(";")) {
+            return true;
+        }
+        let decoded;
+        try {
+            decoded = decodeURIComponent(segment);
+        }
+        catch {
+            return true;
+        }
+        return decoded === "." || decoded === ".." || decoded.includes("/") || decoded.includes("\\");
+    });
+}
 function assertRelativeServicePath(path) {
     if (typeof path !== "string" ||
         // URL parsing silently strips tabs and newlines, which could hide a "..".
         /[\u0000-\u001f\u007f]/.test(path) ||
         !path.startsWith("/") ||
         path.startsWith("//") ||
-        path.includes("\\") ||
-        hasDotSegment(path.split(/[?#]/, 1)[0])) {
+        path.includes("\\")) {
         throw new Error(PATH_ERROR);
+    }
+    if (hasAmbiguousSegments(path.split(/[?#]/, 1)[0])) {
+        throw new Error("Tool client paths cannot contain dot segments, encoded \"/\" or \"\\\", empty segments, \";\" parameters or malformed percent-encoding.");
     }
 }
 // Builds the final URL and checks the parser's normalized result, not just the raw input.
